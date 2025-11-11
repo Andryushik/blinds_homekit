@@ -1,72 +1,84 @@
 #include "Arduino.h"
 #include "Helper.h"
 
-Helper::Helper() {
-  SPIFFS.begin();
+Helper::Helper()
+{
+  if (!SPIFFS.begin())
+  {
+    Serial.println("SPIFFS mount failed");
+  }
   this->_configfile = "/config.json";
 }
 
-boolean Helper::loadconfig() {
+boolean Helper::loadconfig()
+{
   File configFile = SPIFFS.open(this->_configfile, "r");
-  if (!configFile) {
+  if (!configFile)
+  {
     Serial.println(F("Failed to open config file"));
     return false;
   }
 
   size_t size = configFile.size();
-  if (size > 1024) {
+  if (size > 1024)
+  {
     Serial.println(F("Config file size is too large"));
+    configFile.close();
     return false;
   }
 
   // Allocate a buffer to store contents of the file.
-  //std::unique_ptr<char[]> buf(new char[size]);
+  // std::unique_ptr<char[]> buf(new char[size]);
 
   // We don't use String here because ArduinoJson library requires the input
   // buffer to be mutable. If you don't use ArduinoJson, you may as well
   // use configFile.readString instead.
-  //configFile.readBytes(buf.get(), size);
+  // configFile.readBytes(buf.get(), size);
 
-  //No more memory leaks
+  // No more memory leaks
   DynamicJsonBuffer jsonBuffer(300);
 
-  //Reading from buffer breaks first key
-  //this->_config = jsonBuffer.parseObject(buf.get());
+  // Reading from buffer breaks first key
+  // this->_config = jsonBuffer.parseObject(buf.get());
 
-  //Reading directly from file DOES NOT cause currentPosition to break
+  // Reading directly from file DOES NOT cause currentPosition to break
   this->_config = jsonBuffer.parseObject(configFile);
 
-  //Avoid leaving opened files
+  // Avoid leaving opened files
   configFile.close();
 
-  if (!this->_config.success()) {
+  if (!this->_config.success())
+  {
     Serial.println("Failed to parse config file");
     return false;
   }
   return true;
 }
 
-JsonVariant Helper::getconfig() {
+JsonVariant Helper::getconfig()
+{
   return this->_config;
 }
 
-boolean Helper::saveconfig(JsonVariant json) {
+boolean Helper::saveconfig(JsonVariant json)
+{
   File configFile = SPIFFS.open(this->_configfile, "w");
-  if (!configFile) {
+  if (!configFile)
+  {
     Serial.println("Failed to open config file for writing");
     return false;
   }
 
   json.printTo(configFile);
-  configFile.flush(); //Making sure it's saved
-
+  configFile.flush(); // Making sure it's saved
+  // Close file so resources are released and data is committed
+  configFile.close();
   Serial.println("Saved JSON to SPIFFS");
-  json.printTo(Serial);
-  Serial.println();
   return true;
 }
 
-void Helper::resetsettings(WiFiManager& wifim) {
+void Helper::resetsettings(WiFiManager &wifim)
+{
   SPIFFS.format();
   wifim.resetSettings();
 }

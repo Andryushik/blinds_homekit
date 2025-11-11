@@ -7,19 +7,7 @@
 #include <WiFi.h>
 #endif
 
-void wifiConnect() {
-	WiFi.hostname("RollerBlind");
-
-	WiFiManager wifiManager;
-    wifiManager.autoConnect("Roller Blind Configuration");
-
-	Serial.println("WiFi connecting...");
-	while (!WiFi.isConnected()) {
-		delay(100);
-		Serial.print(".");
-	}
-	Serial.print("\n");
-	Serial.printf("WiFi connected, IP: %s\n", WiFi.localIP().toString().c_str());
-}
+// Prototype only — implementation is in wifi.cpp to avoid multiple definitions
+void wifiConnect();
 
 #endif

@@ -1,33 +1,31 @@
 #include <Arduino.h>
+#include <math.h>
 #include <arduino_homekit_server.h>
 #include "Helper.h"
 #include "pins.h"
 #include "wifi.h"
 #include <EasyButton.h>
 #include <AccelStepper.h>
+#include "Buttons.h"
+#include "Globals.h"
 
-#define LOG_D(fmt, ...)   printf_P(PSTR(fmt "\n") , ##__VA_ARGS__)
+//  Speed settings (read-only shared constants)
+const float SPEED_MAX = 3000.0f; // steps/s
+const float ACCEL = 500.0f;      // steps/s^2
+const float CAL_SPEED = 800.0f;  // steps/s during calibration (continuous)
 
 // 28BYJ-48 via ULN2003 using HALF4WIRE; coil order IN1, IN3, IN2, IN4
 AccelStepper stepper(AccelStepper::HALF4WIRE, IN1, IN3, IN2, IN4);
-const int STEPS_PER_REV = 2048; // ~64:1 gearbox, ~0.18° per step
-
-enum mode { NORMAL, CALIBRATE };
-enum calibrationStep { NONE, INIT, UP_KNOWN };
-
-mode currentMode = NORMAL;
-calibrationStep currentCalibrationStep = NONE;
 
 // EasyButton with internal pullups and inverted logic (pressed = LOW)
-EasyButton mainButton(BUTTON_MAIN, 35, true, true);
+// MAIN is synthesized as simultaneous press of UP+DOWN
 EasyButton upButton(BUTTON_UP_PIN, 35, true, true);
 EasyButton downButton(BUTTON_DOWN_PIN, 35, true, true);
 
 Helper helper;
 
-int maxSteps = 0, currentStep = 0, targetStep = 0;
-uint32_t startupTime = 0;
-uint32_t lastMovementTime = 0;
+// Centralized runtime state
+BlindsState state = {NORMAL, NONE, false, false, 0, false, false, false, 0, 0, 200, 0, 0, 0, 0, 0, 0};
 
 // HomeKit characteristics (provided by accessory.c)
 extern "C" homekit_characteristic_t currentPosition;
@@ -37,74 +35,125 @@ extern "C" homekit_server_config_t config;
 
 // HomeKit getters/setters
 homekit_value_t currentPositionGet() { return currentPosition.value; }
-homekit_value_t targetPositionGet()  { return targetPosition.value; }
-homekit_value_t positionStateGet()   { return positionState.value; }
+homekit_value_t targetPositionGet() { return targetPosition.value; }
+homekit_value_t positionStateGet() { return positionState.value; }
 void currentPositionSet(homekit_value_t value) { currentPosition.value = value; }
-void targetPositionSet(homekit_value_t value)  { targetPosition.value = value; }
-void positionStateSet(homekit_value_t value)   { positionState.value = value; }
+void targetPositionSet(homekit_value_t value) { targetPosition.value = value; }
+void positionStateSet(homekit_value_t value) { positionState.value = value; }
 
 static uint32_t nextLedMillis = 0;
-static uint32_t nextHeapMillis = 0;
 
 int getCurrentPosition();
 bool loadConfig();
 bool saveConfig();
-bool resetConfig();
 void enableCalibrationMode();
-void handleButtons();
 void properLedDisplay();
 void handleEngineControllerActivity();
 void homekitSetup();
 void homekitLoop();
 void blindControl();
-void move(bool down);
 
-void setup() {
+void setup()
+{
   pinMode(LED_PIN, OUTPUT);
-  pinMode(BUTTON_MAIN, INPUT_PULLUP);
+  // BUTTON_MAIN (D0) not used; MAIN is simultaneous UP+DOWN
   pinMode(BUTTON_UP_PIN, INPUT_PULLUP);
   pinMode(BUTTON_DOWN_PIN, INPUT_PULLUP);
 
   Serial.begin(115200);
-  startupTime = millis();
+  // Allow debug output to go through even during WiFi
+  // Keep system debug output off to reduce serial noise
+  Serial.setDebugOutput(false);
+  state.startupTime = millis();
 
   loadConfig();
-  if (maxSteps == 0) {
+  if (state.maxSteps == 0)
+  {
     enableCalibrationMode();
   }
 
-  // Stepper tuning for 28BYJ-48 on ULN2003
-  stepper.setMaxSpeed(500);      // steps/s (start with 300–500)
-  stepper.setAcceleration(100);  // steps/s^2 (start with 50–150)
-  stepper.setCurrentPosition(currentStep);
+  // Initialize stepper with normal motion profile.
+  stepper.setMaxSpeed(SPEED_MAX);
+  stepper.setAcceleration(ACCEL);
+  stepper.setCurrentPosition(state.currentStep);
 
   wifiConnect();
   homekitSetup();
-
-  mainButton.begin();
+  // initialize buttons
   upButton.begin();
   downButton.begin();
 }
 
-void loop() {
-  mainButton.read();
+void loop()
+{
+  static bool wasCalibrating = false;
+  // mainButton removed; read UP/DOWN only
   upButton.read();
   downButton.read();
+  // Heartbeat disabled to reduce log noise
 
   handleButtons();
   properLedDisplay();
   handleEngineControllerActivity();
+  // Calibration: continuous runSpeed() for smooth/faster motion.
+  if (state.currentMode == CALIBRATE)
+  {
+    wasCalibrating = true;
 
-  // If there is a target to reach, consider the motor active
-  if (stepper.distanceToGo() != 0) {
-    lastMovementTime = millis();
+    bool up = upButton.isPressed();
+    bool down = downButton.isPressed();
+    // Wait for initial release so accidental held buttons don't start motion
+    if (state.calRequireRelease)
+    {
+      if (!up && !down)
+      {
+        state.calRequireRelease = false;
+      }
+    }
+
+    if (!state.calRequireRelease)
+    {
+      // Continuous speed control: setSpeed() + runSpeed() must be called frequently
+      if (up && !down)
+      {
+        // negative speed moves toward top (smaller step numbers)
+        stepper.setSpeed(-CAL_SPEED);
+        stepper.runSpeed();
+        state.lastMovementTime = millis();
+      }
+      else if (down && !up)
+      {
+        stepper.setSpeed(CAL_SPEED);
+        stepper.runSpeed();
+        state.lastMovementTime = millis();
+      }
+      else
+      {
+        // no buttons pressed during calibration: explicitly clear speed to avoid
+        // leaving a stale speed value. We don't call runSpeed() so no stepping.
+        stepper.setSpeed(0.0f);
+      }
+    }
+  }
+  else
+  {
+    // If we just exited calibration, restore normal motion profile
+    if (wasCalibrating)
+    {
+      stepper.setAcceleration(ACCEL);
+      stepper.setMaxSpeed(SPEED_MAX);
+      wasCalibrating = false;
+    }
+
+    if (stepper.distanceToGo() != 0)
+    {
+      state.lastMovementTime = millis();
+    }
+    stepper.run();
   }
 
-  // Non-blocking stepper control
-  stepper.run();
-
   // Keep software step counter in sync with driver
-  currentStep = stepper.currentPosition();
+  state.currentStep = stepper.currentPosition();
 
   homekitLoop();
   blindControl();
@@ -113,10 +162,14 @@ void loop() {
   delay(1);
 }
 
-void properLedDisplay() {
-  if (currentMode == CALIBRATE) {
+void properLedDisplay()
+{
+  blinkUpdate();
+  if (state.currentMode == CALIBRATE)
+  {
     const uint32_t t = millis();
-    if (t > nextLedMillis) {
+    if (t > nextLedMillis)
+    {
       nextLedMillis = t + 250;
       digitalWrite(LED_PIN, !digitalRead(LED_PIN));
     }
@@ -125,155 +178,153 @@ void properLedDisplay() {
   digitalWrite(LED_PIN, LOW);
 }
 
-void reset() {
+void reset()
+{
   WiFiManager wifiManager;
   helper.resetsettings(wifiManager);
   homekit_storage_reset();
-  LOG_D("Stored settings removed");
 }
 
 // Turn motor power off after inactivity (kept for state housekeeping)
-void handleEngineControllerActivity() {
-  if (lastMovementTime != 0 && millis() - lastMovementTime > 100) {
-    lastMovementTime = 0;
-    saveConfig();
-    if (maxSteps != 0) {
-      currentPosition.value.int_value = getCurrentPosition();
-      homekit_characteristic_notify(&currentPosition, currentPosition.value);
+void handleEngineControllerActivity()
+{
+  if (state.lastMovementTime != 0 && millis() - state.lastMovementTime > 100)
+  {
+    state.lastMovementTime = 0;
+    // Avoid saving config while in CALIBRATE; saves during calibration were
+    // noisy and not useful. Persist only when in NORMAL mode.
+    if (state.currentMode != CALIBRATE)
+    {
+      saveConfig();
+      if (state.maxSteps != 0)
+      {
+        currentPosition.value.int_value = getCurrentPosition();
+        homekit_characteristic_notify(&currentPosition, currentPosition.value);
+        if (positionState.value.int_value != POS_STOPPED)
+        {
+          positionState.value.int_value = POS_STOPPED;
+          homekit_characteristic_notify(&positionState, positionState.value);
+        }
+      }
     }
   }
 }
 
 // 0% = bottom (closed), 100% = top (open)
-int getCurrentPosition() {
-  if (maxSteps <= 0) return 0;
-  return 100 - (int)((((float)currentStep / (float)maxSteps) + 0.005f) * 100.0f);
+int getCurrentPosition()
+{
+  if (state.maxSteps <= 0)
+    return 0;
+  // 100% = top (currentStep==0), 0% = bottom (currentStep==maxSteps)
+  int pos = (int)roundf(100.0f - ((float)state.currentStep / (float)state.maxSteps) * 100.0f);
+  if (pos < 0)
+    pos = 0;
+  if (pos > 100)
+    pos = 100;
+  return pos;
 }
 
-bool loadConfig() {
-  LOG_D("Loading config file");
-  if (!helper.loadconfig()) return false;
+bool loadConfig()
+{
+  if (!helper.loadconfig())
+    return false;
 
   JsonVariant json = helper.getconfig();
-  json.printTo(Serial);
-
-  currentStep = json["currentStep"];
-  maxSteps = json["maxSteps"];
+  state.currentStep = json["currentStep"];
+  state.maxSteps = json["maxSteps"];
   targetPosition.value.int_value = json["targetPositionValue"];
+  // Load raw calibration points if present
+  JsonVariant v;
+  v = json["rawUpStep"];
+  if (v)
+    state.upStep = (int)v;
+  else
+    state.upStep = 0;
+  v = json["rawDownStep"];
+  if (v)
+    state.downStep = (int)v;
+  else
+    state.downStep = 0;
+  // Load configurable minTravel if present
+  v = json["minTravel"];
+  if (v)
+    state.minTravel = (int)v;
   currentPosition.value.int_value = getCurrentPosition();
   return true;
 }
 
-bool saveConfig() {
-  LOG_D("Saving config");
+bool saveConfig()
+{
   DynamicJsonBuffer jsonBuffer(500);
-  JsonObject& json = jsonBuffer.createObject();
-  json["currentStep"] = currentStep;
-  json["maxSteps"] = maxSteps;
+  JsonObject &json = jsonBuffer.createObject();
+  json["currentStep"] = state.currentStep;
+  json["maxSteps"] = state.maxSteps;
   json["targetPositionValue"] = targetPosition.value.int_value;
+  // store raw calibration points if present
+  json["rawUpStep"] = state.upStep;
+  json["rawDownStep"] = state.downStep;
+  // store configurable min travel
+  json["minTravel"] = state.minTravel;
   return helper.saveconfig(json);
 }
 
-bool resetConfig() {
-  DynamicJsonBuffer jsonBuffer(500);
-  JsonObject& json = jsonBuffer.createObject();
-  return helper.saveconfig(json);
+void enableCalibrationMode()
+{
+  state.currentMode = CALIBRATE;
+  state.currentCalibrationStep = INIT;
+  // require release of buttons that might have been held when entering CAL
+  state.calRequireRelease = true;
+  stepper.moveTo(stepper.currentPosition());
+  stepper.run();
+  state.lastMovementTime = 0;
+  // During calibration we want a smooth, continuous action via runSpeed()
+  // Disable acceleration so runSpeed() produces steady velocity.
+  stepper.setAcceleration(0.0f);
+  stepper.setMaxSpeed(CAL_SPEED);
+  Serial.println("Entered CALIBRATE mode (continuous runSpeed)");
 }
 
-int upStep = 0;
-
-void enableCalibrationMode() {
-  LOG_D("Calibrate mode");
-  currentMode = CALIBRATE;
-  currentCalibrationStep = INIT;
-}
-
-void handleButtons() {
-  // Ignore buttons for 10s after boot for stability
-  if (millis() - startupTime <= (10 * 1000)) {
+void blindControl()
+{
+  if (state.currentMode != NORMAL || state.maxSteps == 0)
     return;
-  }
-
-  // Factory reset: hold main 10s
-  if (mainButton.pressedFor(10000)) {
-    reset();
-    digitalWrite(LED_PIN, HIGH);
-    wifiConnect();
-    homekitSetup();
-    digitalWrite(LED_PIN, LOW);
-  }
-
-  // Enter calibration: hold main 5s
-  if (mainButton.pressedFor(5000)) {
-    enableCalibrationMode();
-  }
-
-  if (currentMode == CALIBRATE) {
-    // Manual jogging during calibration
-    if (upButton.isPressed()) {
-      move(false); // up
-    }
-    if (downButton.isPressed()) {
-      move(true);  // down
-    }
-
-    if (mainButton.wasPressed()) {
-      if (currentCalibrationStep == INIT) {
-        currentCalibrationStep = UP_KNOWN;
-        upStep = currentStep;
-
-        digitalWrite(LED_PIN, HIGH);
-        delay(500);
-        digitalWrite(LED_PIN, LOW);
-      } else if (currentCalibrationStep == UP_KNOWN) {
-        // Save travel length and exit calibration
-        maxSteps = currentStep - upStep;
-        currentStep = maxSteps;
-        stepper.setCurrentPosition(currentStep);
-
-        targetPosition.value.int_value = 0;
-        homekit_characteristic_notify(&targetPosition, targetPosition.value);
-
-        currentPosition.value.int_value = 0;
-        homekit_characteristic_notify(&currentPosition, currentPosition.value);
-
-        currentMode = NORMAL;
-        saveConfig();
-
-        LOG_D("Device calibrated, max steps: %d", maxSteps);
-      }
-    }
-  } else {
-    // Normal mode: quick presets
-    if (upButton.isPressed()) {
-      targetPosition.value.int_value = 100;
-      homekit_characteristic_notify(&targetPosition, targetPosition.value);
-    }
-    if (downButton.isPressed()) {
-      targetPosition.value.int_value = 0;
-      homekit_characteristic_notify(&targetPosition, targetPosition.value);
-    }
-    if (mainButton.isPressed()) {
-      targetPosition.value.int_value = currentPosition.value.int_value;
-      homekit_characteristic_notify(&targetPosition, targetPosition.value);
-    }
-  }
-}
-
-void blindControl() {
-  if (currentMode != NORMAL || maxSteps == 0) return;
 
   // Convert target percentage to steps
-  targetStep = ((100 - (float)targetPosition.value.int_value) / 100.0f) * maxSteps;
+  state.targetStep = ((100 - (float)targetPosition.value.int_value) / 100.0f) * state.maxSteps;
 
   // Command stepper to the target (run() moves it)
-  if (targetStep != stepper.targetPosition()) {
-    stepper.moveTo(targetStep);
-    lastMovementTime = millis();
+  if (state.targetStep != stepper.targetPosition())
+  {
+    stepper.moveTo(state.targetStep);
+    state.lastMovementTime = millis();
+
+    // Update positionState based on direction
+    long dist = stepper.targetPosition() - stepper.currentPosition();
+    int newState;
+    if (dist == 0)
+      newState = POS_STOPPED;
+    else if (dist > 0)
+      newState = POS_DECREASING; // moving toward larger steps -> blinds going down (closing)
+    else
+      newState = POS_INCREASING; // moving toward smaller steps -> blinds going up (opening)
+
+    if (positionState.value.int_value != newState)
+    {
+      positionState.value.int_value = newState;
+      homekit_characteristic_notify(&positionState, positionState.value);
+    }
+  }
+
+  // If no distance left and we previously reported moving, set STOPPED
+  if (stepper.distanceToGo() == 0 && positionState.value.int_value != POS_STOPPED)
+  {
+    positionState.value.int_value = POS_STOPPED;
+    homekit_characteristic_notify(&positionState, positionState.value);
   }
 }
 
-void homekitSetup() {
+void homekitSetup()
+{
   currentPosition.setter = currentPositionSet;
   currentPosition.getter = currentPositionGet;
 
@@ -281,26 +332,12 @@ void homekitSetup() {
   targetPosition.getter = targetPositionGet;
 
   positionState.setter = positionStateSet;
-  positionState.getter  = positionStateGet;
+  positionState.getter = positionStateGet;
 
   arduino_homekit_setup(&config);
 }
 
-void homekitLoop() {
+void homekitLoop()
+{
   arduino_homekit_loop();
-
-  const uint32_t t = millis();
-  if (t > nextHeapMillis) {
-    nextHeapMillis = t + 5000;
-    LOG_D("Free heap: %d, HomeKit clients: %d",
-          ESP.getFreeHeap(), arduino_homekit_connected_clients_count());
-    LOG_D("Target position: %d", targetPosition.value.int_value);
-  }
-}
-
-// Manual single step for calibration/buttons
-void move(bool down) {
-  // Down increases count, up decreases — same semantics as original code
-  stepper.move(down ? +1 : -1);
-  lastMovementTime = millis();
 }
